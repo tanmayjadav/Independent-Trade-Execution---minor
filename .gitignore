@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Credentials and Sensitive Data
+credentials.json
+config.json
+.env
+
+# Logs
+logs/
+*.log
+
+# Debug Files
+debug/
+
+# IDE
+.vscode/
+.idea/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+System_Flow_Explanation.md
+view_today_report.py
+reports/
+reference/
