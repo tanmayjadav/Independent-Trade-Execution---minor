@@ -257,6 +257,60 @@ class TradeRepository:
         except PyMongoError:
             return []
 
+    def get_today_orders(self):
+        """
+        Get all orders placed today.
+        Returns list of order documents.
+        """
+        return self.get_date_orders(datetime.now().date())
+
+    def get_date_orders(self, target_date: date):
+        """
+        Get all orders placed on a specific date.
+        Returns list of order documents.
+        """
+        try:
+            date_start = datetime.combine(target_date, datetime.min.time())
+            date_end = datetime.combine(target_date, datetime.max.time())
+            
+            orders = list(self.orders.find({
+                "timestamp": {
+                    "$gte": date_start,
+                    "$lte": date_end
+                }
+            }).sort("timestamp", 1))
+            
+            return orders
+        except PyMongoError:
+            return []
+
+    def get_today_positions(self):
+        """
+        Get all positions updated today.
+        Returns list of position documents.
+        """
+        return self.get_date_positions(datetime.now().date())
+
+    def get_date_positions(self, target_date: date):
+        """
+        Get all positions updated on a specific date.
+        Returns list of position documents.
+        """
+        try:
+            date_start = datetime.combine(target_date, datetime.min.time())
+            date_end = datetime.combine(target_date, datetime.max.time())
+            
+            positions = list(self.positions.find({
+                "updated_at": {
+                    "$gte": date_start,
+                    "$lte": date_end
+                }
+            }).sort("updated_at", 1))
+            
+            return positions
+        except PyMongoError:
+            return []
+
     def get_today_stats(self):
         """
         Calculate comprehensive statistics for today's trading session.
