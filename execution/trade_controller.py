@@ -58,6 +58,69 @@ class TradeController:
         self.order_timeout = exec_config.get("order_timeout_seconds", 30)
 
     # -------------------------------------------------
+    # REST LTP fallback (when websocket subscription/ticks are delayed)
+    # -------------------------------------------------
+
+    @staticmethod
+    def _extract_ltp_from_quote_response(quote_response) -> float:
+        """
+        Best-effort extractor for LTP from variance_connect broker quote payloads.
+        AngelOne.get_quote_data() returns a dict response; we try common shapes.
+        """
+        try:
+            if quote_response is None:
+                return 0.0
+
+            # Sometimes callers might already pass a numeric LTP
+            if isinstance(quote_response, (int, float)):
+                return float(quote_response)
+
+            if not isinstance(quote_response, dict):
+                return 0.0
+
+            # Common AngelOne response: {"data": {"fetched": [{"ltp": ...}, ...]}}
+            data = quote_response.get("data")
+            if isinstance(data, dict):
+                fetched = data.get("fetched")
+                if isinstance(fetched, list) and fetched:
+                    first = fetched[0]
+                    if isinstance(first, dict):
+                        for key in ("ltp", "last_traded_price", "lastTradedPrice"):
+                            if key in first and first[key] is not None:
+                                return float(first[key])
+
+                for key in ("ltp", "last_traded_price", "lastTradedPrice"):
+                    if key in data and data[key] is not None:
+                        return float(data[key])
+
+            # Fallback: top-level keys
+            for key in ("ltp", "last_traded_price", "lastTradedPrice"):
+                if key in quote_response and quote_response[key] is not None:
+                    return float(quote_response[key])
+
+        except Exception:
+            return 0.0
+
+        return 0.0
+
+    def _get_rest_ltp(self, contract) -> float:
+        """
+        Fetch LTP via REST quote API using the market-data streamer's client (variance_connect broker).
+        In paper mode, md_streamer is MD_AngelOne and md_streamer.client is AngelOne (REST-capable).
+        """
+        md_client = getattr(self.md_streamer, "client", None) if self.md_streamer else None
+        if md_client is None or not hasattr(md_client, "get_quote_data"):
+            return 0.0
+
+        try:
+            quote = md_client.get_quote_data(contract)
+            return self._extract_ltp_from_quote_response(quote)
+        except Exception as e:
+            symbol = contract.symbol if hasattr(contract, "symbol") else "N/A"
+            self.logger.warning(f"REST LTP fetch failed for {symbol}: {e}", exc_info=True)
+            return 0.0
+
+    # -------------------------------------------------
     # Public API
     # -------------------------------------------------
 
@@ -91,6 +154,7 @@ class TradeController:
         self.logger.info(f"Option selected: {symbol} | Signal: {signal} | Spot: {spot_price:.2f}")
 
         # Subscribe to option contract for market data (needed for LTP)
+        subscription_failed = False
         if self.md_streamer:
             try:
                 self.md_streamer.subscribe(option_contract, subscription_type="LTP")
@@ -101,6 +165,7 @@ class TradeController:
             except Exception as e:
                 symbol = option_contract.symbol if hasattr(option_contract, 'symbol') else 'N/A'
                 self.logger.warning(f"Failed to subscribe to {symbol}: {e}", exc_info=True)
+                subscription_failed = True
 
         # Wait for LTP to be available (market data ticks need time to arrive)
         # Wait up to 15 seconds for LTP to arrive
@@ -110,12 +175,30 @@ class TradeController:
         
         symbol = option_contract.symbol if hasattr(option_contract, 'symbol') else 'N/A'
         contract_token = option_contract.token if hasattr(option_contract, 'token') else 'N/A'
-        
+
+        # If subscription failed, immediately fallback to REST quote LTP (do not ignore trade)
+        if subscription_failed:
+            rest_ltp = self._get_rest_ltp(option_contract)
+            if rest_ltp > 0:
+                entry_price = rest_ltp
+                self.logger.info(f"Using REST LTP for {symbol}: {entry_price:.2f} (subscription failed)")
+
+        rest_fallback_attempted = subscription_failed  # already tried above
         while retry_count < max_retries:
-            entry_price = self.broker.get_ltp(option_contract)
+            if entry_price <= 0:
+                entry_price = self.broker.get_ltp(option_contract)
             if entry_price > 0:
                 self.logger.info(f"LTP obtained for {symbol} after {retry_count + 1} retries: {entry_price:.2f}")
                 break
+
+            # If ticks are delayed, try REST quote once after a short wait instead of skipping
+            if (not rest_fallback_attempted) and retry_count >= 2:
+                rest_ltp = self._get_rest_ltp(option_contract)
+                rest_fallback_attempted = True
+                if rest_ltp > 0:
+                    entry_price = rest_ltp
+                    self.logger.info(f"Using REST LTP for {symbol}: {entry_price:.2f} (no ticks yet)")
+                    break
             
             time.sleep(1)  # 1 second per retry
             retry_count += 1
@@ -128,6 +211,7 @@ class TradeController:
             self.logger.warning(f"  - Option contract is not actively traded (no trades = no ticks)")
             self.logger.warning(f"  - Market data subscription is delayed (Angel One may take time)")
             self.logger.warning(f"  - Contract symbol/token mismatch (check if subscription succeeded)")
+            self.logger.warning(f"  - REST quote LTP fallback returned no price")
             return
 
         # Update broker's LTP cache with the price we got
