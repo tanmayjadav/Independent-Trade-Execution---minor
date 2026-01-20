@@ -167,7 +167,7 @@ def setup_components(config, broker, im, underlying_contract, md_streamer):
     db_name = config["deployment"].get("db_name", "ema_xts")
     trade_repo = TradeRepository(mongo_uri=mongo_uri, db_name=db_name)
     reporter = SessionReporter(
-        webhook_url=config["deployment"]["discord_webhook"],
+        webhook_url=config["deployment"].get("discord_webhook") or config["deployment"].get("discord_webhook_alerts", ""),
         trade_repo=trade_repo
     )
     
@@ -702,7 +702,7 @@ if __name__ == "__main__":
             from reporting.discord import DiscordAlert
             with open("config.json", "r") as f:
                 config = json.load(f)
-            webhook_url = config.get("deployment", {}).get("discord_webhook", "")
+            webhook_url = config.get("deployment", {}).get("discord_webhook") or config.get("deployment", {}).get("discord_webhook_alerts", "")
             if webhook_url:
                 discord = DiscordAlert()
                 discord.send_error_alert(
