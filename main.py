@@ -209,6 +209,10 @@ class MarketDataHandler:
         # Initialize loggers once as instance variables
         self.logger = get_component_logger("market_data")
         self.strategy_logger = get_component_logger("strategy")
+        # Rate limiting for disconnect warnings
+        self._last_disconnect_log_time = 0
+        self._disconnect_log_interval = 5  # Only log once per 5 seconds
+        self._disconnect_count = 0
     
     def on_connect(self, event):
         """Handle market data connection"""
@@ -226,10 +230,24 @@ class MarketDataHandler:
     def on_disconnect(self, event):
         """Handle market data disconnection"""
         broker_name = "Angel One" if self.is_paper else "XTS"
-        # Only log disconnections during market hours
+        current_time = time.time()
+        
+        # Rate limit disconnect warnings to prevent spam
+        # (Multiple subscriptions disconnect individually, causing many events)
         if MarketClock.is_market_open():
-            self.logger.warning(f"{broker_name} Market Data Disconnected")
+            self._disconnect_count += 1
+            # Only log once per interval, or if it's the first disconnect
+            if (current_time - self._last_disconnect_log_time) >= self._disconnect_log_interval:
+                if self._disconnect_count > 1:
+                    self.logger.warning(f"{broker_name} Market Data Disconnected ({self._disconnect_count} disconnect events)")
+                else:
+                    self.logger.warning(f"{broker_name} Market Data Disconnected")
+                self._last_disconnect_log_time = current_time
+                self._disconnect_count = 0
         # Outside market hours, disconnections are expected - don't spam logs
+        # Reset counter when market closes
+        elif self._disconnect_count > 0:
+            self._disconnect_count = 0
     
     def on_error(self, event):
         """Handle market data errors"""
@@ -330,34 +348,68 @@ class MarketDataHandler:
         for pos_order_id, position in list(exit_manager.positions.items()):
             if position.get("sl_order_id") == order_id:
                 exit_price = event.filled_price
-                # Update SL order status in database
+                # Update SL order status in database (critical: ensure status is updated)
                 if trade_repo:
                     try:
-                        trade_repo.update_order(
+                        result = trade_repo.update_order(
                             order_id=order_id,
                             status="FILLED",
                             filled_quantity=position["quantity"],
                             filled_price=exit_price
                         )
+                        if result and result.matched_count > 0:
+                            logger.info(f"Updated SL order {order_id} status to FILLED in database")
+                        else:
+                            # Order not found - try to create it (shouldn't happen, but handle gracefully)
+                            logger.warning(f"SL order {order_id} not found in database, attempting to create")
+                            try:
+                                trade_repo.update_order(
+                                    order_id=order_id,
+                                    status="FILLED",
+                                    filled_quantity=position["quantity"],
+                                    filled_price=exit_price,
+                                    upsert=True
+                                )
+                                logger.info(f"Created SL order {order_id} in database with FILLED status")
+                            except Exception as e2:
+                                logger.error(f"Failed to create SL order in database: {e2}", exc_info=True)
                     except Exception as e:
-                        logger.error(f"Failed to update SL order status: {e}", exc_info=True)
+                        logger.error(f"Failed to update SL order {order_id} status to FILLED: {e}", exc_info=True)
+                        # Continue anyway - position exit should still proceed
                 # Check if position is still registered (not already being closed)
                 if pos_order_id in exit_manager.positions:
                     exit_manager.exit_position(pos_order_id, position, exit_price, reason="SL")
                 return
             elif position.get("tp_order_id") == order_id:
                 exit_price = event.filled_price
-                # Update TP order status in database
+                # Update TP order status in database (critical: ensure status is updated)
                 if trade_repo:
                     try:
-                        trade_repo.update_order(
+                        result = trade_repo.update_order(
                             order_id=order_id,
                             status="FILLED",
                             filled_quantity=position["quantity"],
                             filled_price=exit_price
                         )
+                        if result and result.matched_count > 0:
+                            logger.info(f"Updated TP order {order_id} status to FILLED in database")
+                        else:
+                            # Order not found - try to create it (shouldn't happen, but handle gracefully)
+                            logger.warning(f"TP order {order_id} not found in database, attempting to create")
+                            try:
+                                trade_repo.update_order(
+                                    order_id=order_id,
+                                    status="FILLED",
+                                    filled_quantity=position["quantity"],
+                                    filled_price=exit_price,
+                                    upsert=True
+                                )
+                                logger.info(f"Created TP order {order_id} in database with FILLED status")
+                            except Exception as e2:
+                                logger.error(f"Failed to create TP order in database: {e2}", exc_info=True)
                     except Exception as e:
-                        logger.error(f"Failed to update TP order status: {e}", exc_info=True)
+                        logger.error(f"Failed to update TP order {order_id} status to FILLED: {e}", exc_info=True)
+                        # Continue anyway - position exit should still proceed
                 # Check if position is still registered (not already being closed)
                 if pos_order_id in exit_manager.positions:
                     exit_manager.exit_position(pos_order_id, position, exit_price, reason="TP")
@@ -413,7 +465,64 @@ def setup_market_data_streamer(config, broker, md_broker, instrument_manager=Non
     return md_streamer
 
 # ========================================
-# 7. MAIN EXECUTION
+# 7. HELPER FUNCTIONS
+# ========================================
+
+def safe_call(func, *args, error_msg="", logger=None, **kwargs):
+    """Safely call a function, logging errors but not raising exceptions."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        if logger:
+            logger.error(f"{error_msg}: {e}", exc_info=True)
+        return None
+
+def process_eod(components, md_streamer, logger=None):
+    """Process end-of-day: send report and stop streamer."""
+    if logger is None:
+        logger = get_logger("eod")
+    
+    current_time_str = datetime.now().strftime("%H:%M:%S")
+    logger.info(f"Market closed at {current_time_str}. Sending end-of-day report...")
+    print(f"\nMarket closed at {current_time_str}. Sending end-of-day report...")
+    
+    # Send EOD report
+    safe_call(
+        lambda: components['reporter'].send_eod_report() if 'reporter' in components else None,
+        error_msg="Failed to send EOD report",
+        logger=logger
+    )
+    
+    # Stop market data streamer
+    safe_call(
+        lambda: md_streamer.stop_streaming() if hasattr(md_streamer, 'stop_streaming') else None,
+        error_msg="Failed to stop market data streamer",
+        logger=logger
+    )
+    if hasattr(md_streamer, 'stop_streaming'):
+        logger.info("Market data streamer stopped")
+
+def shutdown_system(md_streamer, components, send_eod=False):
+    """Gracefully shutdown the system."""
+    logger = get_logger("shutdown")
+    
+    # Stop streamer
+    safe_call(
+        lambda: md_streamer.stop_streaming() if hasattr(md_streamer, 'stop_streaming') else None,
+        error_msg="Failed to stop streamer during shutdown",
+        logger=logger
+    )
+    
+    # Send EOD if requested and market was open
+    if send_eod and MarketClock.is_market_open():
+        safe_call(
+            lambda: components['reporter'].send_eod_report() if 'reporter' in components else None,
+            error_msg="Failed to send final EOD report",
+            logger=logger
+        )
+
+# ========================================
+# 8. MAIN EXECUTION
 # ========================================
 
 def main():
@@ -489,101 +598,89 @@ def main():
         try:
             # Trading loop - only runs while market is open
             while MarketClock.is_market_open():
-                # Check for end-of-day square-off
-                components['exit_manager'].check_squareoff()
+                # Check for end-of-day square-off (safe call - continues on error)
+                safe_call(
+                    components['exit_manager'].check_squareoff,
+                    error_msg="Error in check_squareoff",
+                    logger=get_logger("error")
+                )
+                
+                # Exit immediately if market closed after square-off
+                if not MarketClock.is_market_open():
+                    get_logger("eod").info("Market closed detected after square-off check")
+                    break
                 
                 # Print status every 30 seconds
                 current_time = time.time()
                 if current_time - last_status_time >= status_interval:
-                    # Get EMA values from strategy
                     strategy = components['strategy']
-                    candle_agg = components['candle_agg']
-                    
-                    # Count closed candles
                     candles_count = len(strategy.candles)
                     needed_candles = strategy.slow_period
-                    
                     ema_fast = strategy.fast_ema
                     ema_slow = strategy.slow_ema
                     
-                    # Format EMA values (show 2 decimal places or progress if not enough candles)
+                    # Format EMA values
                     if ema_fast is not None and ema_slow is not None:
                         ema_fast_str = f"{ema_fast:.2f}"
                         ema_slow_str = f"{ema_slow:.2f}"
                     else:
-                        # Show progress: how many candles we have vs need
-                        ema_fast_str = f"N/A ({candles_count}/{needed_candles})" if candles_count < needed_candles else "N/A"
-                        ema_slow_str = f"N/A ({candles_count}/{needed_candles})" if candles_count < needed_candles else "N/A"
+                        progress = f"({candles_count}/{needed_candles})" if candles_count < needed_candles else ""
+                        ema_fast_str = f"N/A {progress}".strip()
+                        ema_slow_str = f"N/A {progress}".strip()
                     
                     status_msg = f"Time: {time.strftime('%H:%M:%S')} | Tick: {handler.tick_count} | EMA{strategy.fast_period}: {ema_fast_str} | EMA{strategy.slow_period}: {ema_slow_str}"
                     print(status_msg)
-                    logger = get_logger("status")
-                    logger.info(status_msg)
+                    get_logger("status").info(status_msg)
                     last_status_time = current_time
                 
+                # Sleep in chunks to check market status frequently (exit quickly when market closes)
+                for _ in range(2):  # Check every 0.5 seconds
+                    if not MarketClock.is_market_open():
+                        break
+                    time.sleep(0.5)
+            
+            # Market closed - process EOD and wait for next session
+            if not MarketClock.is_market_open():
+                process_eod(components, md_streamer)
+                
+                # Wait for next market open
+                logger = get_logger("eod")
+                logger.info("Waiting for next market open...")
+                print("Waiting for next market open...")
+                MarketClock.wait_for_market_open(check_interval=3600, verbose=True)
+                
+                # Restart market data stream
+                logger.info("Market is open. Restarting market data stream...")
+                print("Market is open. Restarting market data stream...")
+                stream_thread = threading.Thread(target=md_streamer.start_streaming, daemon=True)
+                stream_thread.start()
+                logger.info("Market data stream thread restarted")
                 time.sleep(1)
-            
-            # Market closed - send EOD report
-            logger = get_logger("eod")
-            logger.info("Market closed. Sending end-of-day report...")
-            print("\nMarket closed. Sending end-of-day report...")
-            
-            try:
-                if 'reporter' in components:
-                    components['reporter'].send_eod_report()
-            except Exception as e:
-                logger.error(f"Failed to send EOD report: {e}", exc_info=True)
-            
-            # Stop the market data streamer
-            try:
-                if hasattr(md_streamer, 'stop_streaming'):
-                    md_streamer.stop_streaming()
-                    logger.info("Market data streamer stopped")
-            except Exception as e:
-                logger.error(f"Failed to stop market data streamer: {e}", exc_info=True)
-            
-            # Wait for next market open
-            logger.info("Waiting for next market open...")
-            print("Waiting for next market open...")
-            MarketClock.wait_for_market_open(check_interval=3600, verbose=True)
-            
-            # Restart market data stream for next session
-            logger.info("Market is open. Restarting market data stream...")
-            print("Market is open. Restarting market data stream...")
-            stream_thread = threading.Thread(target=md_streamer.start_streaming, daemon=True)
-            stream_thread.start()
-            logger.info("Market data stream thread restarted")
-            time.sleep(1)
-            
-            # Reset status tracking for new session
-            last_status_time = time.time()
+                last_status_time = time.time()
             
         except KeyboardInterrupt:
             print("\n\nShutting down gracefully...")
-            logger = get_logger("shutdown")
-            logger.info("User requested shutdown")
-            
-            # Stop the market data streamer
-            try:
-                if hasattr(md_streamer, 'stop_streaming'):
-                    md_streamer.stop_streaming()
-            except:
-                pass
-            
-            # Send final EOD report if market was open
-            try:
-                if 'reporter' in components and MarketClock.is_market_open():
-                    components['reporter'].send_eod_report()
-            except:
-                pass
-            
+            get_logger("shutdown").info("User requested shutdown")
+            shutdown_system(md_streamer, components, send_eod=True)
             sys.exit(0)
+            
         except Exception as e:
             logger = get_logger("error")
             logger.error(f"Unexpected error in main loop: {e}", exc_info=True)
             print(f"\nUnexpected error: {e}")
-            print("Waiting 60 seconds before retrying...")
-            time.sleep(60)  # Wait before retrying
+            
+            # If market closed, process EOD and wait for next session
+            if not MarketClock.is_market_open():
+                logger.info("Market is closed. Processing EOD after error.")
+                process_eod(components, md_streamer, logger)
+                MarketClock.wait_for_market_open(check_interval=3600, verbose=True)
+                stream_thread = threading.Thread(target=md_streamer.start_streaming, daemon=True)
+                stream_thread.start()
+                last_status_time = time.time()
+            else:
+                # Market still open - wait and retry
+                print("Waiting 60 seconds before retrying...")
+                time.sleep(60)
 
 # ========================================
 # RUN
@@ -599,4 +696,24 @@ if __name__ == "__main__":
         print(f"\nFatal error: {e}")
         import traceback
         traceback.print_exc()
+        
+        # Send fatal error to Discord if webhook is configured
+        try:
+            from reporting.discord import DiscordAlert
+            with open("config.json", "r") as f:
+                config = json.load(f)
+            webhook_url = config.get("deployment", {}).get("discord_webhook", "")
+            if webhook_url:
+                discord = DiscordAlert()
+                discord.send_error_alert(
+                    webhook_url=webhook_url,
+                    error_type="CRITICAL",
+                    error_message=f"Fatal error during startup: {str(e)}",
+                    component="main",
+                    traceback_str=traceback.format_exc(),
+                    additional_info={"Status": "System crashed during startup"}
+                )
+        except:
+            pass  # Don't let Discord errors prevent exit
+        
         sys.exit(1)

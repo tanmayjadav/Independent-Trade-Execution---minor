@@ -80,14 +80,30 @@ def position_to_doc(position, status: str):
     Positions are aggregated by symbol, so we need to handle multiple orders
     for the same asset by calculating weighted average price.
     """
+    now = datetime.utcnow()
     return {
+        # identity / linkage
+        "position_id": position.get("position_id"),
         "symbol": position["contract"].symbol,
+        # quantities
+        "quantity": position.get("quantity", 0),  # Net open qty (remaining)
+        "opened_quantity": position.get("opened_quantity"),
+        "closed_quantity": position.get("closed_quantity"),
+        # pricing
         "entry_price": position.get("entry_price"),  # Weighted average for multiple orders
         "exit_price": position.get("exit_price"),
-        "quantity": position["quantity"],  # Total quantity across all orders
+        "last_price": position.get("last_price"),
+        # PnL
+        "realized_pnl": position.get("realized_pnl"),
+        "unrealized_pnl": position.get("unrealized_pnl"),
+        "net_pnl": position.get("net_pnl"),
+        # lifecycle
         "status": status,
-        "order_ids": position.get("order_ids", []),  # List of order_ids that contributed to this position
-        "updated_at": datetime.utcnow(),
+        "order_ids": position.get("order_ids", []),  # Entry order_ids that contributed
+        "exit_order_ids": position.get("exit_order_ids", []),
+        "created_at": position.get("created_at", now),
+        "updated_at": now,
+        "closed_at": position.get("closed_at"),
     }
 
 

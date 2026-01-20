@@ -282,7 +282,50 @@ class TradeController:
         current_status = self.broker.get_order_status(order_id) if hasattr(self.broker, 'get_order_status') else OrderStatus.PENDING
         
         if current_status in (OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED):
-            # Order already processed
+            # Order already processed - update database if needed
+            if current_status == OrderStatus.CANCELLED and self.trade_repo:
+                try:
+                    # Ensure database reflects cancelled status
+                    self.trade_repo.update_order(
+                        order_id=order_id,
+                        status="CANCELLED"
+                    )
+                except Exception as e:
+                    self.logger.debug(f"Order {order_id} already cancelled, database update skipped or failed: {e}")
+            
+            if order_id in self.pending_orders:
+                del self.pending_orders[order_id]
+            return
+        
+        # Check timeout: if order has been pending longer than timeout period
+        placed_at = order_info.get("placed_at", 0)
+        elapsed_time = time.time() - placed_at if placed_at > 0 else float('inf')
+        
+        if elapsed_time >= self.order_timeout:
+            # Order timed out, cancel it
+            self.logger.warning(f"Cancelling order {order_id}: Timeout after {elapsed_time:.1f}s (limit: {self.order_timeout}s)")
+            if hasattr(self.broker, 'cancel_order'):
+                try:
+                    self.broker.cancel_order(order_id)
+                except Exception as e:
+                    self.logger.error(f"Failed to cancel order {order_id} via broker: {e}", exc_info=True)
+            
+            # Update database status to CANCELLED
+            if self.trade_repo:
+                try:
+                    self.trade_repo.update_order(
+                        order_id=order_id,
+                        status="CANCELLED"
+                    )
+                    self.logger.info(f"Updated order {order_id} status to CANCELLED in database (timeout)")
+                except Exception as e:
+                    self.logger.error(f"Failed to update order status in database: {e}", exc_info=True)
+            
+            # Update position status
+            if order_id in self.open_positions:
+                self.open_positions[order_id]["status"] = OrderStatus.CANCELLED
+                del self.open_positions[order_id]
+            
             if order_id in self.pending_orders:
                 del self.pending_orders[order_id]
             return
@@ -296,7 +339,21 @@ class TradeController:
                 # Price moved beyond tolerance, cancel order
                 self.logger.warning(f"Cancelling order {order_id}: Price moved {price_change_pct:.2f}% beyond tolerance")
                 if hasattr(self.broker, 'cancel_order'):
-                    self.broker.cancel_order(order_id)
+                    try:
+                        self.broker.cancel_order(order_id)
+                    except Exception as e:
+                        self.logger.error(f"Failed to cancel order {order_id} via broker: {e}", exc_info=True)
+                
+                # Update database status to CANCELLED
+                if self.trade_repo:
+                    try:
+                        self.trade_repo.update_order(
+                            order_id=order_id,
+                            status="CANCELLED"
+                        )
+                        self.logger.info(f"Updated order {order_id} status to CANCELLED in database (price tolerance exceeded)")
+                    except Exception as e:
+                        self.logger.error(f"Failed to update order status in database: {e}", exc_info=True)
                 
                 # Update position status
                 if order_id in self.open_positions:
@@ -379,38 +436,63 @@ class TradeController:
         if hasattr(self.broker, 'order_fills') and order_id in self.broker.order_fills:
             individual_fills = self.broker.order_fills[order_id]
         
-        # Create trades for each individual fill
-        if individual_fills and len(individual_fills) > 0:
-            # We have individual fills - create a trade for each
-            fill_number = 1
-            for fill_qty, fill_price, _ in individual_fills:
-                if self.trade_repo:
-                    try:
+        # Create ENTRY trades and update aggregated DB position using *fill deltas* (idempotent)
+        if self.trade_repo and position.get("contract") is not None:
+            try:
+                next_fill_number = int(position.get("_next_fill_number", 1) or 1)
+
+                if individual_fills and len(individual_fills) > 0:
+                    processed = int(position.get("_fills_processed", 0) or 0)
+                    new_fills = individual_fills[processed:]
+
+                    for fill_qty, fill_price, _ in new_fills:
+                        # 1) Trade ledger
                         self.trade_repo.save_trade(
                             order_id=order_id,
                             trade_type="ENTRY",
                             price=fill_price,
                             quantity=fill_qty,
-                            fill_number=fill_number
+                            fill_number=next_fill_number
                         )
-                        self.logger.info(f"Created ENTRY trade: Order {order_id} | Fill #{fill_number} | Qty: {fill_qty} @ {fill_price:.2f}")
-                        fill_number += 1
-                    except Exception as e:
-                        self.logger.error(f"Failed to save entry trade: {e}", exc_info=True)
-        else:
-            # No individual fills available - create one trade for the fill event
-            if self.trade_repo:
-                try:
-                    self.trade_repo.save_trade(
-                        order_id=order_id,
-                        trade_type="ENTRY",
-                        price=event.filled_price,
-                        quantity=event.filled_quantity,
-                        fill_number=1
-                    )
-                    self.logger.info(f"Created ENTRY trade: Order {order_id} | Qty: {event.filled_quantity} @ {event.filled_price:.2f}")
-                except Exception as e:
-                    self.logger.error(f"Failed to save entry trade: {e}", exc_info=True)
+                        self.logger.info(
+                            f"Created ENTRY trade: Order {order_id} | Fill #{next_fill_number} | Qty: {fill_qty} @ {fill_price:.2f}"
+                        )
+
+                        # 2) Aggregated position state
+                        self.trade_repo.apply_entry_fill(
+                            contract=position["contract"],
+                            order_id=order_id,
+                            quantity=int(fill_qty),
+                            fill_price=float(fill_price),
+                        )
+                        next_fill_number += 1
+
+                    position["_fills_processed"] = len(individual_fills)
+                    position["_next_fill_number"] = next_fill_number
+                else:
+                    # Fallback for brokers that don't provide per-fill breakdown
+                    accounted = int(position.get("_accounted_filled_quantity", 0) or 0)
+                    delta = int(event.filled_quantity) - accounted
+                    if delta > 0:
+                        self.trade_repo.save_trade(
+                            order_id=order_id,
+                            trade_type="ENTRY",
+                            price=event.filled_price,
+                            quantity=delta,
+                            fill_number=next_fill_number
+                        )
+                        self.logger.info(f"Created ENTRY trade: Order {order_id} | Qty: {delta} @ {event.filled_price:.2f}")
+
+                        self.trade_repo.apply_entry_fill(
+                            contract=position["contract"],
+                            order_id=order_id,
+                            quantity=int(delta),
+                            fill_price=float(event.filled_price),
+                        )
+                        position["_accounted_filled_quantity"] = int(event.filled_quantity)
+                        position["_next_fill_number"] = next_fill_number + 1
+            except Exception as e:
+                self.logger.error(f"Failed to save entry trade / update position: {e}", exc_info=True)
         
         # Update filled quantity
         if event.is_partial:
@@ -437,6 +519,14 @@ class TradeController:
                 del self.pending_orders[order_id]
             
             self.logger.info(f"Order filled: {event.filled_quantity} @ {event.filled_price:.2f}")
+
+        # Ensure in-memory position quantity reflects *filled* quantity (critical for SL/TP sizing)
+        if "order_quantity" not in position:
+            position["order_quantity"] = position.get("quantity", 0)
+        try:
+            position["quantity"] = int(position.get("filled_quantity", position.get("quantity", 0)) or 0)
+        except Exception:
+            pass
 
         # Update order status in database when filled (ALWAYS update, even if position processing failed)
         if self.trade_repo:
@@ -494,27 +584,7 @@ class TradeController:
                 self.logger.error(f"Failed to update order status in database: {e}", exc_info=True)
 
         # Register position with exit manager (partial fills are always allowed)
-        # Save position to database
-        if self.trade_repo:
-            try:
-                # Ensure entry_price is set before saving
-                if position.get("entry_price") is None:
-                    position["entry_price"] = event.filled_price
-                    self.logger.warning(f"entry_price was None for position {order_id}, using filled_price: {event.filled_price:.2f}")
-                
-                # Ensure order_ids list exists for position aggregation
-                if "order_ids" not in position:
-                    position["order_ids"] = [order_id]
-                elif order_id not in position["order_ids"]:
-                    position["order_ids"].append(order_id)
-                
-                self.trade_repo.upsert_position(
-                    position,
-                    status="OPEN"
-                )
-                self.logger.info(f"Saved position to database: {order_id} | Status: OPEN | Entry: {position.get('entry_price'):.2f}")
-            except Exception as e:
-                self.logger.error(f"Failed to save position to database: {e}", exc_info=True)
+        # Position persistence is handled above via apply_entry_fill (fill-delta safe).
 
         # Notify risk manager
         self.risk_manager.on_new_position(

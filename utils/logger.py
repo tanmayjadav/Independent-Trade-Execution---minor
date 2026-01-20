@@ -10,6 +10,65 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
+class DailyRotatingFileHandler(logging.FileHandler):
+    """
+    Custom file handler that rotates log files daily based on date in filename.
+    Creates a new file when the date changes.
+    """
+    
+    def __init__(self, log_dir, base_filename, mode='a', encoding='utf-8', delay=False):
+        """
+        Initialize daily rotating file handler.
+        
+        Args:
+            log_dir: Directory for log files
+            base_filename: Base filename (without date), e.g., "trading_engine"
+            mode: File mode
+            encoding: File encoding
+            delay: Delay file creation until first write
+        """
+        self.log_dir = Path(log_dir)
+        self.base_filename = base_filename
+        self.current_date = None
+        
+        # Create log directory if it doesn't exist
+        self.log_dir.mkdir(exist_ok=True)
+        
+        # Get initial file path
+        today = datetime.now().strftime('%Y%m%d')
+        self.current_date = today
+        initial_file = self.log_dir / f"{self.base_filename}_{today}.log"
+        
+        # Call parent with the initial file path
+        super().__init__(str(initial_file), mode, encoding, delay)
+    
+    def _get_file_path(self):
+        """Get current log file path based on today's date."""
+        today = datetime.now().strftime('%Y%m%d')
+        return self.log_dir / f"{self.base_filename}_{today}.log"
+    
+    def emit(self, record):
+        """Emit a log record, switching to new file if date changed."""
+        # Check if date has changed
+        today = datetime.now().strftime('%Y%m%d')
+        current_file = self._get_file_path()
+        
+        # If date changed, switch to new file
+        if self.current_date != today:
+            # Close current file
+            if self.stream:
+                self.flush()
+                self.stream.close()
+            
+            # Update to new file
+            self.current_date = today
+            self.baseFilename = str(current_file)
+            self.stream = self._open()
+        
+        # Call parent emit
+        super().emit(record)
+
+
 class TradingLogger:
     """
     Centralized logging system for the trading engine.
@@ -50,12 +109,11 @@ class TradingLogger:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # File handler with rotation (10MB per file, keep 5 backups)
-        log_file = log_path / f"trading_engine_{datetime.now().strftime('%Y%m%d')}.log"
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=10 * 1024 * 1024,  # 10MB
-            backupCount=5,
+        # File handler with daily rotation (creates new file when date changes)
+        file_handler = DailyRotatingFileHandler(
+            log_dir=log_dir,
+            base_filename="trading_engine",
+            mode='a',
             encoding='utf-8'
         )
         file_handler.setLevel(log_level)
@@ -72,7 +130,8 @@ class TradingLogger:
         cls._logger = logger
         cls._initialized = True
         
-        logger.info(f"Logger initialized | Log file: {log_file}")
+        initial_log_file = file_handler.baseFilename
+        logger.info(f"Logger initialized | Log file: {initial_log_file}")
         return logger
     
     @classmethod

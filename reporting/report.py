@@ -102,10 +102,21 @@ class SessionReporter:
         max_win = round(max(self.win_pnls), 2) if self.win_pnls else 0.0
         max_loss = round(max(self.loss_pnls), 2) if self.loss_pnls else 0.0
 
+        # Get total trade records (ENTRY + EXIT) for reference
+        total_trade_records = 0
+        if self.trade_repo:
+            try:
+                today = datetime.now().date()
+                all_trades = self.trade_repo.get_date_trades(today)
+                total_trade_records = len(all_trades) if all_trades else 0
+            except:
+                pass
+        
         message = {
             "title": "NIFTY EMA – End of Day Report",
             "date": datetime.now().strftime("%d %b %Y"),
-            "total trades": self.total_trades,
+            "completed trades": self.total_trades,  # Closed positions (EXIT trades only)
+            "total trade records": total_trade_records if total_trade_records > 0 else None,  # All fills (ENTRY + EXIT)
             "wins": self.wins,
             "losses": self.losses,
             "win rate (%)": win_rate,
@@ -192,9 +203,20 @@ class SessionReporter:
             writer.writerow(["Date", today.strftime("%d %b %Y")])
             writer.writerow([])  # Empty row
             
+            # Get total trade records for CSV
+            total_trade_records = 0
+            if self.trade_repo:
+                try:
+                    all_trades = self.trade_repo.get_date_trades(today)
+                    total_trade_records = len(all_trades) if all_trades else 0
+                except:
+                    pass
+            
             # Write metrics
             writer.writerow(["Metric", "Value"])
-            writer.writerow(["Total Trades", self.total_trades])
+            writer.writerow(["Completed Trades (Closed Positions)", self.total_trades])
+            if total_trade_records > 0:
+                writer.writerow(["Total Trade Records (All Fills)", total_trade_records])
             writer.writerow(["Wins", self.wins])
             writer.writerow(["Losses", self.losses])
             writer.writerow(["Win Rate (%)", win_rate])

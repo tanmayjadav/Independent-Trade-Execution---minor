@@ -7,6 +7,7 @@ from database.model import (
     position_to_doc,
     daily_summary_to_doc,
 )
+import uuid
 
 
 class TradeRepository:
@@ -121,62 +122,229 @@ class TradeRepository:
     # ----------------------------
     # Positions
     # ----------------------------
-    def upsert_position(self, position, status):
+    def _compute_pnls(self, entry_price: float, last_price: float, open_qty: int, realized_pnl: float):
+        unrealized = 0.0
+        if entry_price is not None and last_price is not None and open_qty is not None:
+            try:
+                unrealized = (float(last_price) - float(entry_price)) * int(open_qty)
+            except Exception:
+                unrealized = 0.0
+        net = float(realized_pnl or 0.0) + float(unrealized or 0.0)
+        return float(unrealized), float(net)
+
+    def apply_entry_fill(self, contract, order_id: str, quantity: int, fill_price: float):
         """
-        Upsert position by symbol.
-        For multiple orders on same symbol, aggregates quantity and calculates weighted average price.
+        Apply an ENTRY fill to the aggregated OPEN position for a symbol.
+
+        - Increases open quantity
+        - Updates weighted-average entry price (average cost)
+        - Preserves created_at for the open position
+        """
+        if quantity is None or quantity <= 0:
+            return
+
+        try:
+            symbol = contract.symbol
+            now = datetime.utcnow()
+
+            existing = self.positions.find_one({"symbol": symbol, "status": "OPEN"})
+            if not existing:
+                # Create new OPEN position
+                doc = {
+                    "position_id": str(uuid.uuid4()),
+                    "contract": contract,  # not stored by position_to_doc; kept here only for callers that pass dicts
+                    "quantity": int(quantity),
+                    "opened_quantity": int(quantity),
+                    "closed_quantity": 0,
+                    "entry_price": float(fill_price),
+                    "exit_price": None,
+                    "last_price": float(fill_price),
+                    "realized_pnl": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "net_pnl": 0.0,
+                    "order_ids": [order_id] if order_id else [],
+                    "exit_order_ids": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "closed_at": None,
+                }
+                # position_to_doc expects a dict with contract; we pass it through to preserve compatibility
+                self.positions.insert_one(position_to_doc(doc, status="OPEN"))
+                return
+
+            # Aggregate into existing OPEN position
+            existing_qty = int(existing.get("quantity", 0) or 0)
+            existing_entry = existing.get("entry_price")
+            existing_entry = float(existing_entry) if existing_entry is not None else 0.0
+
+            new_qty = int(quantity)
+            new_price = float(fill_price)
+
+            total_qty = existing_qty + new_qty
+            if total_qty > 0:
+                weighted_entry = ((existing_entry * existing_qty) + (new_price * new_qty)) / total_qty
+            else:
+                weighted_entry = new_price
+
+            order_ids = existing.get("order_ids", []) or []
+            if order_id and order_id not in order_ids:
+                order_ids.append(order_id)
+
+            opened_qty = int(existing.get("opened_quantity", existing_qty) or 0) + new_qty
+            realized = float(existing.get("realized_pnl", 0.0) or 0.0)
+            last_price = float(existing.get("last_price", new_price) or new_price)
+            unrealized, net = self._compute_pnls(weighted_entry, last_price, total_qty, realized)
+
+            self.positions.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {
+                    "entry_price": float(weighted_entry),
+                    "quantity": int(total_qty),
+                    "opened_quantity": int(opened_qty),
+                    "order_ids": order_ids,
+                    "last_price": last_price,
+                    "unrealized_pnl": float(unrealized),
+                    "net_pnl": float(net),
+                    "updated_at": now,
+                }}
+            )
+        except PyMongoError:
+            pass
+        except Exception:
+            pass
+
+    def apply_exit_fill(self, contract, exit_order_id: str, quantity: int, exit_price: float, reason: str = None):
+        """
+        Apply an EXIT fill to the aggregated OPEN position for a symbol.
+
+        - Decreases open quantity (supports partial exits)
+        - Accumulates realized_pnl
+        - Tracks weighted-average exit_price across closed_quantity
+        - Marks CLOSED when quantity reaches 0 (sets closed_at)
+        """
+        if quantity is None or quantity <= 0:
+            return
+
+        try:
+            symbol = contract.symbol
+            now = datetime.utcnow()
+
+            existing = self.positions.find_one({"symbol": symbol, "status": "OPEN"})
+            if not existing:
+                return
+
+            open_qty = int(existing.get("quantity", 0) or 0)
+            if open_qty <= 0:
+                return
+
+            exit_qty = min(int(quantity), open_qty)
+            entry_price = existing.get("entry_price")
+            entry_price = float(entry_price) if entry_price is not None else float(exit_price)
+            px = float(exit_price)
+
+            realized_prev = float(existing.get("realized_pnl", 0.0) or 0.0)
+            realized_inc = (px - entry_price) * exit_qty
+            realized_new = realized_prev + realized_inc
+
+            closed_qty_prev = int(existing.get("closed_quantity", 0) or 0)
+            closed_qty_new = closed_qty_prev + exit_qty
+
+            # Weighted average exit price across all closed quantity
+            prev_exit_px = existing.get("exit_price")
+            prev_exit_px = float(prev_exit_px) if prev_exit_px is not None else 0.0
+            if closed_qty_new > 0:
+                weighted_exit = ((prev_exit_px * closed_qty_prev) + (px * exit_qty)) / closed_qty_new
+            else:
+                weighted_exit = px
+
+            remaining_qty = open_qty - exit_qty
+
+            exit_order_ids = existing.get("exit_order_ids", []) or []
+            if exit_order_id and exit_order_id not in exit_order_ids:
+                exit_order_ids.append(exit_order_id)
+
+            last_price = px
+            unrealized, net = self._compute_pnls(entry_price, last_price, remaining_qty, realized_new)
+
+            update_doc = {
+                "quantity": int(remaining_qty),
+                "closed_quantity": int(closed_qty_new),
+                "exit_price": float(weighted_exit),
+                "exit_order_ids": exit_order_ids,
+                "last_price": last_price,
+                "realized_pnl": float(realized_new),
+                "unrealized_pnl": float(unrealized),
+                "net_pnl": float(net),
+                "updated_at": now,
+            }
+
+            if remaining_qty == 0:
+                update_doc["status"] = "CLOSED"
+                update_doc["closed_at"] = now
+
+            self.positions.update_one({"_id": existing["_id"]}, {"$set": update_doc})
+        except PyMongoError:
+            pass
+        except Exception:
+            pass
+
+    def update_mark_to_market(self, contract, ltp: float):
+        """
+        Update last_price and unrealized/net PnL for the OPEN position for a symbol.
+        This is safe to call frequently (writes one small $set).
         """
         try:
-            symbol = position["contract"].symbol
-            
-            # Get existing position if it exists
-            existing_pos = self.positions.find_one({"symbol": symbol, "status": "OPEN"})
-            
-            if existing_pos and status == "OPEN":
-                # Aggregate with existing position: calculate weighted average price
-                existing_qty = existing_pos.get("quantity", 0)
-                existing_price = existing_pos.get("entry_price", 0)
-                new_qty = position.get("quantity", 0)
-                new_price = position.get("entry_price", 0)
-                
-                # Calculate weighted average
-                total_qty = existing_qty + new_qty
-                if total_qty > 0:
-                    weighted_avg_price = ((existing_price * existing_qty) + (new_price * new_qty)) / total_qty
-                else:
-                    weighted_avg_price = new_price
-                
-                # Get existing order_ids and add new one
-                existing_order_ids = existing_pos.get("order_ids", [])
-                new_order_id = position.get("order_id")
-                if new_order_id and new_order_id not in existing_order_ids:
-                    existing_order_ids.append(new_order_id)
-                
-                # Update position with aggregated values
-                update_doc = {
-                    "symbol": symbol,
-                    "entry_price": weighted_avg_price,
-                    "quantity": total_qty,
-                    "status": status,
-                    "order_ids": existing_order_ids,
+            symbol = contract.symbol
+            existing = self.positions.find_one({"symbol": symbol, "status": "OPEN"})
+            if not existing:
+                return
+
+            entry_price = existing.get("entry_price")
+            if entry_price is None:
+                return
+
+            qty = int(existing.get("quantity", 0) or 0)
+            realized = float(existing.get("realized_pnl", 0.0) or 0.0)
+            last_price = float(ltp)
+            unrealized, net = self._compute_pnls(float(entry_price), last_price, qty, realized)
+
+            self.positions.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {
+                    "last_price": last_price,
+                    "unrealized_pnl": float(unrealized),
+                    "net_pnl": float(net),
                     "updated_at": datetime.utcnow(),
-                }
-                
-                self.positions.update_one(
-                    {"symbol": symbol, "status": "OPEN"},
-                    {"$set": update_doc}
+                }}
+            )
+        except PyMongoError:
+            pass
+        except Exception:
+            pass
+
+    def upsert_position(self, position, status):
+        """
+        Backward-compatible API.
+
+        - status="OPEN": treated as an ENTRY addition (uses position.quantity + position.entry_price)
+        - status="CLOSED": treated as a full EXIT for that symbol (uses position.quantity + position.exit_price)
+        """
+        try:
+            contract = position["contract"]
+            if status == "OPEN":
+                self.apply_entry_fill(
+                    contract=contract,
+                    order_id=position.get("order_id"),
+                    quantity=int(position.get("quantity", 0) or 0),
+                    fill_price=float(position.get("entry_price") or 0.0),
                 )
-            else:
-                # New position or closing position - use position_to_doc
-                # Ensure order_ids is a list
-                if "order_ids" not in position:
-                    order_id = position.get("order_id")
-                    position["order_ids"] = [order_id] if order_id else []
-                
-                self.positions.update_one(
-                    {"symbol": symbol},
-                    {"$set": position_to_doc(position, status)},
-                    upsert=True,
+            elif status == "CLOSED":
+                self.apply_exit_fill(
+                    contract=contract,
+                    exit_order_id=position.get("order_id"),
+                    quantity=int(position.get("quantity", 0) or 0),
+                    exit_price=float(position.get("exit_price") or position.get("price") or 0.0),
+                    reason=None,
                 )
         except PyMongoError:
             pass

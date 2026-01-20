@@ -7,6 +7,7 @@ from variance_connect.utils.enums import (
     TimeInForce
 )
 from utils.logger import get_component_logger
+import time
 
 
 class ExitManager:
@@ -107,19 +108,85 @@ class ExitManager:
             
             # Cancel broker stop-loss order if exists
             if self.use_broker_sl_orders and pos.get("sl_order_id"):
+                sl_order_id = pos["sl_order_id"]
                 try:
-                    if hasattr(self.broker, 'cancel_order'):
-                        self.broker.cancel_order(pos["sl_order_id"])
+                    # Check if order is still pending before cancelling
+                    if hasattr(self.broker, 'get_order_status'):
+                        order_status = self.broker.get_order_status(sl_order_id)
+                        if order_status not in ("FILLED", "CANCELLED", "REJECTED"):
+                            # Order is still pending, cancel it
+                            if hasattr(self.broker, 'cancel_order'):
+                                self.broker.cancel_order(sl_order_id)
+                            
+                            # Update database status to CANCELLED
+                            if self.trade_repo:
+                                try:
+                                    self.trade_repo.update_order(
+                                        order_id=sl_order_id,
+                                        status="CANCELLED"
+                                    )
+                                    self.logger.info(f"Updated SL order {sl_order_id} status to CANCELLED in database")
+                                except Exception as e:
+                                    self.logger.error(f"Failed to update SL order status in database: {e}", exc_info=True)
+                        else:
+                            self.logger.debug(f"SL order {sl_order_id} already in final state: {order_status}")
+                    else:
+                        # Fallback: try to cancel without status check
+                        if hasattr(self.broker, 'cancel_order'):
+                            self.broker.cancel_order(sl_order_id)
+                        # Update database status
+                        if self.trade_repo:
+                            try:
+                                self.trade_repo.update_order(
+                                    order_id=sl_order_id,
+                                    status="CANCELLED"
+                                )
+                                self.logger.info(f"Updated SL order {sl_order_id} status to CANCELLED in database")
+                            except Exception as e:
+                                self.logger.error(f"Failed to update SL order status in database: {e}", exc_info=True)
                 except Exception as e:
-                    self.logger.warning(f"Failed to cancel SL order {pos['sl_order_id']}: {e}")
+                    self.logger.warning(f"Failed to cancel/update SL order {sl_order_id}: {e}", exc_info=True)
             
             # Cancel broker take-profit order if exists
             if self.use_broker_sl_orders and pos.get("tp_order_id"):
+                tp_order_id = pos["tp_order_id"]
                 try:
-                    if hasattr(self.broker, 'cancel_order'):
-                        self.broker.cancel_order(pos["tp_order_id"])
+                    # Check if order is still pending before cancelling
+                    if hasattr(self.broker, 'get_order_status'):
+                        order_status = self.broker.get_order_status(tp_order_id)
+                        if order_status not in ("FILLED", "CANCELLED", "REJECTED"):
+                            # Order is still pending, cancel it
+                            if hasattr(self.broker, 'cancel_order'):
+                                self.broker.cancel_order(tp_order_id)
+                            
+                            # Update database status to CANCELLED
+                            if self.trade_repo:
+                                try:
+                                    self.trade_repo.update_order(
+                                        order_id=tp_order_id,
+                                        status="CANCELLED"
+                                    )
+                                    self.logger.info(f"Updated TP order {tp_order_id} status to CANCELLED in database")
+                                except Exception as e:
+                                    self.logger.error(f"Failed to update TP order status in database: {e}", exc_info=True)
+                        else:
+                            self.logger.debug(f"TP order {tp_order_id} already in final state: {order_status}")
+                    else:
+                        # Fallback: try to cancel without status check
+                        if hasattr(self.broker, 'cancel_order'):
+                            self.broker.cancel_order(tp_order_id)
+                        # Update database status
+                        if self.trade_repo:
+                            try:
+                                self.trade_repo.update_order(
+                                    order_id=tp_order_id,
+                                    status="CANCELLED"
+                                )
+                                self.logger.info(f"Updated TP order {tp_order_id} status to CANCELLED in database")
+                            except Exception as e:
+                                self.logger.error(f"Failed to update TP order status in database: {e}", exc_info=True)
                 except Exception as e:
-                    self.logger.warning(f"Failed to cancel TP order {pos['tp_order_id']}: {e}")
+                    self.logger.warning(f"Failed to cancel/update TP order {tp_order_id}: {e}", exc_info=True)
         
         self.positions.pop(order_id, None)
 
@@ -139,6 +206,18 @@ class ExitManager:
         for order_id, pos in list(self.positions.items()):
             if pos["contract"].token != token:
                 continue
+
+            # Mark-to-market update for aggregated DB position (throttled)
+            if self.trade_repo:
+                try:
+                    last_update = float(pos.get("_last_mtm_db_update", 0.0) or 0.0)
+                    now_ts = time.time()
+                    mtm_interval = float(self.config.get("execution", {}).get("mtm_db_update_seconds", 2.0))
+                    if now_ts - last_update >= mtm_interval:
+                        self.trade_repo.update_mark_to_market(pos["contract"], ltp)
+                        pos["_last_mtm_db_update"] = now_ts
+                except Exception:
+                    pass
 
             # Update highest/lowest prices for trailing stops (tracking only)
             if ltp > pos["highest_price"]:
@@ -330,14 +409,15 @@ class ExitManager:
                     fill_number=1
                 )
                 self.logger.info(f"Saved EXIT trade to database: Exit Order {exit_order_id} | Entry Order {order_id} | Qty: {position['quantity']} | Entry: {entry_price:.2f} | Exit: {exit_price:.2f} | PnL: {pnl:.2f} | Reason: {reason}")
-                
-                # Update position status to CLOSED
-                # Ensure entry_price is set in position dict before saving
-                position["exit_price"] = exit_price
-                if position.get("entry_price") is None:
-                    position["entry_price"] = entry_price
-                self.trade_repo.upsert_position(position, status="CLOSED")
-                self.logger.info(f"Updated position in database: {order_id} | Status: CLOSED | Entry: {entry_price:.2f}")
+
+                # Apply EXIT fill to aggregated OPEN position (supports partial exits)
+                self.trade_repo.apply_exit_fill(
+                    contract=position["contract"],
+                    exit_order_id=exit_order_id,
+                    quantity=int(position["quantity"]),
+                    exit_price=float(exit_price),
+                    reason=reason,
+                )
             except Exception as e:
                 self.logger.error(f"Failed to save trade to database: {e}", exc_info=True)
 
@@ -352,20 +432,93 @@ class ExitManager:
         self.reporter.on_trade_closed(pnl)
 
         # Cancel broker orders if they exist (they may have already executed)
+        # Note: If exit was via SL, the SL order already filled and status was updated in main.py
+        # If exit was via TP, the TP order already filled and status was updated in main.py
+        # If exit was via SQUAREOFF, we need to cancel any pending SL/TP orders
         if self.use_broker_sl_orders:
             if position.get("sl_order_id"):
+                sl_order_id = position["sl_order_id"]
                 try:
-                    if hasattr(self.broker, 'cancel_order'):
-                        self.broker.cancel_order(position["sl_order_id"])
-                except:
-                    pass  # Order may have already executed
+                    # Only cancel if order hasn't already filled
+                    if hasattr(self.broker, 'get_order_status'):
+                        order_status = self.broker.get_order_status(sl_order_id)
+                        if order_status not in ("FILLED", "CANCELLED", "REJECTED"):
+                            # Order is still pending, cancel it
+                            if hasattr(self.broker, 'cancel_order'):
+                                self.broker.cancel_order(sl_order_id)
+                            
+                            # Update database status to CANCELLED
+                            if self.trade_repo:
+                                try:
+                                    self.trade_repo.update_order(
+                                        order_id=sl_order_id,
+                                        status="CANCELLED"
+                                    )
+                                    self.logger.info(f"Updated SL order {sl_order_id} status to CANCELLED (position closed via {reason})")
+                                except Exception as e:
+                                    self.logger.error(f"Failed to update SL order status in database: {e}", exc_info=True)
+                        # else: Order already filled/cancelled, status already updated
+                    else:
+                        # Fallback: try to cancel and update status
+                        if hasattr(self.broker, 'cancel_order'):
+                            try:
+                                self.broker.cancel_order(sl_order_id)
+                            except:
+                                pass  # Order may have already executed
+                        # Update database status
+                        if self.trade_repo:
+                            try:
+                                self.trade_repo.update_order(
+                                    order_id=sl_order_id,
+                                    status="CANCELLED"
+                                )
+                                self.logger.info(f"Updated SL order {sl_order_id} status to CANCELLED (position closed via {reason})")
+                            except Exception as e:
+                                self.logger.error(f"Failed to update SL order status in database: {e}", exc_info=True)
+                except Exception as e:
+                    self.logger.warning(f"Failed to cancel/update SL order {sl_order_id}: {e}", exc_info=True)
             
             if position.get("tp_order_id"):
+                tp_order_id = position["tp_order_id"]
                 try:
-                    if hasattr(self.broker, 'cancel_order'):
-                        self.broker.cancel_order(position["tp_order_id"])
-                except:
-                    pass  # Order may have already executed
+                    # Only cancel if order hasn't already filled
+                    if hasattr(self.broker, 'get_order_status'):
+                        order_status = self.broker.get_order_status(tp_order_id)
+                        if order_status not in ("FILLED", "CANCELLED", "REJECTED"):
+                            # Order is still pending, cancel it
+                            if hasattr(self.broker, 'cancel_order'):
+                                self.broker.cancel_order(tp_order_id)
+                            
+                            # Update database status to CANCELLED
+                            if self.trade_repo:
+                                try:
+                                    self.trade_repo.update_order(
+                                        order_id=tp_order_id,
+                                        status="CANCELLED"
+                                    )
+                                    self.logger.info(f"Updated TP order {tp_order_id} status to CANCELLED (position closed via {reason})")
+                                except Exception as e:
+                                    self.logger.error(f"Failed to update TP order status in database: {e}", exc_info=True)
+                        # else: Order already filled/cancelled, status already updated
+                    else:
+                        # Fallback: try to cancel and update status
+                        if hasattr(self.broker, 'cancel_order'):
+                            try:
+                                self.broker.cancel_order(tp_order_id)
+                            except:
+                                pass  # Order may have already executed
+                        # Update database status
+                        if self.trade_repo:
+                            try:
+                                self.trade_repo.update_order(
+                                    order_id=tp_order_id,
+                                    status="CANCELLED"
+                                )
+                                self.logger.info(f"Updated TP order {tp_order_id} status to CANCELLED (position closed via {reason})")
+                            except Exception as e:
+                                self.logger.error(f"Failed to update TP order status in database: {e}", exc_info=True)
+                except Exception as e:
+                    self.logger.warning(f"Failed to cancel/update TP order {tp_order_id}: {e}", exc_info=True)
 
         # Cleanup
         self.deregister_position(order_id)
