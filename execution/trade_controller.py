@@ -117,8 +117,51 @@ class TradeController:
             return self._extract_ltp_from_quote_response(quote)
         except Exception as e:
             symbol = contract.symbol if hasattr(contract, "symbol") else "N/A"
-            self.logger.warning(f"REST LTP fetch failed for {symbol}: {e}", exc_info=True)
-            return 0.0
+            # variance_connect has versions where AngelOne.get_quote_data() crashes due to an internal
+            # key mismatch (expects broker_data['token'] but instrument helper returns broker_token).
+            # Work around by directly calling the Angel One quote REST endpoint with broker_token.
+            # Don't spam full tracebacks for the known variance_connect AngelOne KeyError('token')
+            if isinstance(e, KeyError) and str(e) == "'token'":
+                self.logger.info(f"REST LTP: variance_connect quote bug hit for {symbol} (KeyError 'token'); using direct REST fallback")
+            else:
+                self.logger.warning(f"REST LTP fetch failed for {symbol}: {e}", exc_info=True)
+
+            try:
+                import requests
+                from variance_connect.core.functions.instrument import get_broker_contract_info_from_exchange_token
+
+                # Need instruments + broker mapping to compute broker_token
+                if not hasattr(md_client, "instruments") or md_client.instruments is None:
+                    return 0.0
+
+                broker_data = get_broker_contract_info_from_exchange_token(
+                    md_client.instruments,
+                    getattr(contract, "token", None),
+                    md_client.BROKER
+                )
+                if not broker_data or "broker_token" not in broker_data:
+                    return 0.0
+
+                exchange = md_client.map_exchange[getattr(contract, "exchange", "")]
+                broker_token = str(int(broker_data["broker_token"]))
+
+                url = f"{md_client.ROOT_ENDPOINT}/secure/angelbroking/market/v1/quote/"
+
+                # Prefer explicit headers set on the broker (contain Authorization + X-PrivateKey)
+                headers = getattr(md_client, "headers", None)
+                if not headers and getattr(md_client, "session", None) is not None:
+                    try:
+                        headers = dict(md_client.session.headers)
+                    except Exception:
+                        headers = None
+
+                payload = {"mode": "FULL", "exchangeTokens": {exchange: [broker_token]}}
+                resp = requests.post(url, json=payload, headers=headers, timeout=5)
+                resp.raise_for_status()
+                return self._extract_ltp_from_quote_response(resp.json())
+            except Exception as e2:
+                self.logger.warning(f"Direct AngelOne REST quote fallback failed for {symbol}: {e2}", exc_info=True)
+                return 0.0
 
     # -------------------------------------------------
     # Public API
@@ -536,7 +579,8 @@ class TradeController:
                             trade_type="ENTRY",
                             price=fill_price,
                             quantity=fill_qty,
-                            fill_number=next_fill_number
+                            fill_number=next_fill_number,
+                            symbol=position["contract"].symbol if position.get("contract") is not None else None,
                         )
                         self.logger.info(
                             f"Created ENTRY trade: Order {order_id} | Fill #{next_fill_number} | Qty: {fill_qty} @ {fill_price:.2f}"
@@ -563,7 +607,8 @@ class TradeController:
                             trade_type="ENTRY",
                             price=event.filled_price,
                             quantity=delta,
-                            fill_number=next_fill_number
+                            fill_number=next_fill_number,
+                            symbol=position["contract"].symbol if position.get("contract") is not None else None,
                         )
                         self.logger.info(f"Created ENTRY trade: Order {order_id} | Qty: {delta} @ {event.filled_price:.2f}")
 

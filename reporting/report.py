@@ -294,6 +294,14 @@ class SessionReporter:
                                 ])
                     
                     print(f"Detailed trades report exported to: {trades_filename}")
+
+                    # 3. Export Analyzer-style Trades CSV (round-trip format)
+                    try:
+                        analyzer_filename = os.path.join(reports_dir, f"analyzer_trades_{date_str}.csv")
+                        self._export_analyzer_trades_csv(trades, analyzer_filename)
+                        print(f"Analyzer trades report exported to: {analyzer_filename}")
+                    except Exception as e:
+                        print(f"Failed to export analyzer trades CSV: {e}")
                 else:
                     print("No trades found for today - skipping detailed trades export")
             except Exception as e:
@@ -302,3 +310,67 @@ class SessionReporter:
                 traceback.print_exc()
         else:
             print("Trade repository not available - skipping detailed trades export")
+
+    def _export_analyzer_trades_csv(self, trades: list[dict], filename: str):
+        """
+        Export closed trades in the analyzer-compatible CSV format:
+        entry_datetime, exit_datetime, symbol, side, quantity, entry_price, exit_price, reason
+
+        Notes:
+        - We use EXIT trade documents as "one completed trade".
+        - For brokers using separate SL/TP order_ids, EXIT trades include entry_order_id + entry_datetime.
+        """
+        def _fmt_dt(dt_val):
+            if not dt_val:
+                return ""
+            try:
+                # dt_val is datetime
+                return dt_val.strftime("%d-%m-%Y %H:%M")
+            except Exception:
+                try:
+                    return str(dt_val)
+                except Exception:
+                    return ""
+
+        def _map_reason(r):
+            if not r:
+                return ""
+            r = str(r).upper()
+            if r == "SL":
+                return "STOPLOSS"
+            if r == "TP":
+                return "TAKEPROFIT"
+            return r
+
+        exit_trades = [t for t in (trades or []) if t.get("trade_type") == "EXIT"]
+
+        with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(
+                ["entry_datetime", "exit_datetime", "symbol", "side", "quantity", "entry_price", "exit_price", "reason"]
+            )
+
+            for t in exit_trades:
+                entry_dt = t.get("entry_datetime")  # may be absent for older data
+                exit_dt = t.get("timestamp")
+
+                symbol = t.get("symbol") or ""
+                side = "BUY"  # current strategy is long-only (BUY options)
+
+                qty = t.get("quantity", 0) or 0
+                entry_px = t.get("entry_price", "") or ""
+                exit_px = t.get("exit_price", t.get("price", "")) or ""
+                reason = _map_reason(t.get("reason"))
+
+                writer.writerow(
+                    [
+                        _fmt_dt(entry_dt),
+                        _fmt_dt(exit_dt),
+                        symbol,
+                        side,
+                        qty,
+                        entry_px,
+                        exit_px,
+                        reason,
+                    ]
+                )

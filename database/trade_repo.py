@@ -95,6 +95,9 @@ class TradeRepository:
         entry_price: float = None,  # For EXIT trades
         exit_price: float = None,  # For EXIT trades
         fill_number: int = 1,  # For partial fills
+        symbol: str = None,  # Optional: for analyzer-style exports
+        entry_order_id: str = None,  # Optional: link EXIT back to entry order
+        entry_datetime: datetime = None,  # Optional: entry timestamp
     ):
         """
         Save a trade to database.
@@ -114,6 +117,9 @@ class TradeRepository:
                     entry_price=entry_price,
                     exit_price=exit_price,
                     fill_number=fill_number,
+                    symbol=symbol,
+                    entry_order_id=entry_order_id,
+                    entry_datetime=entry_datetime,
                 )
             )
         except PyMongoError:

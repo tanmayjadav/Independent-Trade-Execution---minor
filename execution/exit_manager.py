@@ -341,9 +341,11 @@ class ExitManager:
             self.logger.warning(f"Position {order_id} already closed or not registered. Skipping exit.")
             return
 
-        # Place exit order only if not using broker orders
-        # (Broker orders execute automatically, so we don't need to place another order)
-        if not self.use_broker_sl_orders:
+        # Place exit order:
+        # - For SL/TP: broker stop/limit orders may have executed already (so no need to place a new one)
+        # - For SQUAREOFF / shutdown: we MUST place a market exit to close the position at market price
+        force_market_exit = reason in ("SQUAREOFF", "SYSTEM_SHUTDOWN", "MANUAL_SHUTDOWN")
+        if (not self.use_broker_sl_orders) or force_market_exit:
             self.broker.place_order(
                 contract=position["contract"],
                 variety=Variety.REGULAR,
@@ -396,6 +398,18 @@ class ExitManager:
         # Save trade and update position in database
         if self.trade_repo:
             try:
+                # Best-effort: compute entry_datetime from earliest ENTRY fill of the entry order_id
+                entry_dt = None
+                try:
+                    entry_fill = self.trade_repo.trades.find_one(
+                        {"order_id": order_id, "trade_type": "ENTRY"},
+                        sort=[("timestamp", 1)],
+                    )
+                    if entry_fill:
+                        entry_dt = entry_fill.get("timestamp")
+                except Exception:
+                    entry_dt = None
+
                 # Save EXIT trade
                 self.trade_repo.save_trade(
                     order_id=exit_order_id,  # Use exit order_id for EXIT trades
@@ -406,7 +420,10 @@ class ExitManager:
                     reason=reason,
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    fill_number=1
+                    fill_number=1,
+                    symbol=position["contract"].symbol if position.get("contract") is not None else None,
+                    entry_order_id=order_id,
+                    entry_datetime=entry_dt,
                 )
                 self.logger.info(f"Saved EXIT trade to database: Exit Order {exit_order_id} | Entry Order {order_id} | Qty: {position['quantity']} | Entry: {entry_price:.2f} | Exit: {exit_price:.2f} | PnL: {pnl:.2f} | Reason: {reason}")
 
@@ -519,6 +536,59 @@ class ExitManager:
                                 self.logger.error(f"Failed to update TP order status in database: {e}", exc_info=True)
                 except Exception as e:
                     self.logger.warning(f"Failed to cancel/update TP order {tp_order_id}: {e}", exc_info=True)
+
+    def close_all_positions(self, reason: str = "SYSTEM_SHUTDOWN"):
+        """
+        Force-close all tracked open positions at (best-effort) market price.
+        Used on shutdown so the system never exits leaving positions open.
+        """
+        if not self.positions:
+            return
+
+        # Disable broker SL orders to avoid relying on them for shutdown close
+        # (we will place market exits regardless)
+        # NOTE: we do NOT permanently mutate config; just behavior during this function.
+        try:
+            self.use_broker_sl_orders = True  # keep cancellation logic active
+        except Exception:
+            pass
+
+        for order_id, pos in list(self.positions.items()):
+            try:
+                contract = pos.get("contract")
+                if contract is None:
+                    continue
+
+                # Prefer live LTP; fallback to REST LTP if available; last resort use entry price
+                ltp = 0.0
+                try:
+                    ltp = float(self.broker.get_ltp(contract) or 0.0)
+                except Exception:
+                    ltp = 0.0
+
+                if ltp <= 0 and hasattr(self.trade_controller, "_get_rest_ltp"):
+                    try:
+                        ltp = float(self.trade_controller._get_rest_ltp(contract) or 0.0)
+                    except Exception:
+                        ltp = 0.0
+
+                if ltp <= 0:
+                    entry_px = pos.get("entry_price") or pos.get("entry_price_original")
+                    try:
+                        ltp = float(entry_px or 0.0)
+                    except Exception:
+                        ltp = 0.0
+
+                if ltp <= 0:
+                    self.logger.warning(f"Shutdown close: No LTP for {contract.symbol}. Skipping close for order {order_id}.")
+                    continue
+
+                self.logger.warning(
+                    f"Shutdown close: Exiting position {contract.symbol} | Qty: {pos.get('quantity')} | Price: {ltp:.2f} | Reason: {reason}"
+                )
+                self._exit_position_internal(order_id, pos, ltp, reason=reason)
+            except Exception as e:
+                self.logger.error(f"Shutdown close failed for order {order_id}: {e}", exc_info=True)
 
         # Cleanup
         self.deregister_position(order_id)

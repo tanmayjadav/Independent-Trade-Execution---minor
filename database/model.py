@@ -31,6 +31,10 @@ def trade_to_doc(
     entry_price: float = None,  # For EXIT trades, the original entry price
     exit_price: float = None,  # For EXIT trades, the exit price
     fill_number: int = 1,  # For partial fills: 1, 2, 3, etc.
+    # Optional fields to support analyzer-style reports
+    symbol: str = None,  # trading symbol (e.g., NIFTY2612025400PE)
+    entry_order_id: str = None,  # link EXIT back to entry order_id (when exit uses separate SL/TP order_id)
+    entry_datetime: datetime = None,  # best-effort entry timestamp for analyzer reports
 ):
     """
     Create trade document.
@@ -59,6 +63,14 @@ def trade_to_doc(
         "quantity": quantity,
         "timestamp": datetime.utcnow(),
     }
+
+    # Optional metadata (safe to omit)
+    if symbol:
+        doc["symbol"] = symbol
+    if entry_order_id:
+        doc["entry_order_id"] = entry_order_id
+    if entry_datetime:
+        doc["entry_datetime"] = entry_datetime
     
     if trade_type == "ENTRY":
         doc["entry_price"] = price
