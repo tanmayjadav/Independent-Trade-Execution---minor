@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Tuple, List
 
 from variance_connect.components import InstrumentManager
 from variance_connect.core.functions.instrument import create_contract_from_raw_data
@@ -33,13 +34,122 @@ from reporting.report import SessionReporter
 from database.trade_repo import TradeRepository
 
 
+def validate_config(config: dict) -> Tuple[bool, List[str]]:
+    """
+    Validate that config.json has all required fields with values.
+    Returns: (is_valid, list_of_missing_fields)
+    """
+    missing = []
+    
+    # Required top-level sections
+    required_sections = ["deployment", "underlying", "market_timing", "strategy", "risk", "execution"]
+    for section in required_sections:
+        if section not in config or not isinstance(config[section], dict):
+            missing.append(f"{section} (section missing)")
+            continue
+        
+        # deployment section
+        if section == "deployment":
+            required_fields = ["paper_trading"]
+            for field in required_fields:
+                if field not in config[section] or config[section][field] is None:
+                    missing.append(f"deployment.{field}")
+            
+            # paper_capital required if paper_trading is True
+            if config[section].get("paper_trading") is True:
+                if "paper_capital" not in config[section] or config[section]["paper_capital"] is None:
+                    missing.append("deployment.paper_capital")
+        
+        # underlying section
+        elif section == "underlying":
+            required_fields = ["asset_name", "strike_interval"]
+            for field in required_fields:
+                if field not in config[section] or not config[section][field]:
+                    missing.append(f"underlying.{field}")
+        
+        # market_timing section
+        elif section == "market_timing":
+            required_fields = ["market_open", "market_close"]
+            for field in required_fields:
+                if field not in config[section] or not config[section][field]:
+                    missing.append(f"market_timing.{field}")
+        
+        # strategy section
+        elif section == "strategy":
+            required_fields = ["fast_ema_period", "slow_ema_period", "timeframe_minutes"]
+            for field in required_fields:
+                if field not in config[section] or config[section][field] is None:
+                    missing.append(f"strategy.{field}")
+        
+        # risk section
+        elif section == "risk":
+            required_fields = ["mode", "value", "allow_multiple_positions", "max_daily_loss", "max_daily_loss_percent"]
+            for field in required_fields:
+                if field not in config[section] or config[section][field] is None:
+                    missing.append(f"risk.{field}")
+        
+        # execution section
+        elif section == "execution":
+            required_fields = [
+                "order_type", "sl_percent", "tp_percent", "squareoff_time",
+                "trailing_sl", "breakeven_enabled", "breakeven_trigger_percent",
+                "sl_update_threshold_percent"
+            ]
+            for field in required_fields:
+                if field not in config[section] or config[section][field] is None:
+                    missing.append(f"execution.{field}")
+    
+    return len(missing) == 0, missing
+
+
+def validate_credentials(credentials: dict, is_paper: bool) -> Tuple[bool, List[str]]:
+    """
+    Validate that credentials.json has all required fields with values.
+    Returns: (is_valid, list_of_missing_fields)
+    """
+    missing = []
+    
+    if is_paper:
+        # Paper trading requires Angel One credentials
+        required_fields = ["client_code", "api_key", "password", "totp_key"]
+        for field in required_fields:
+            if field not in credentials or not credentials[field]:
+                missing.append(f"credentials.{field}")
+    else:
+        # Live trading requires XTS credentials (adjust based on your broker)
+        # For now, we'll check for common fields
+        required_fields = ["user_id", "api_key", "api_secret"]
+        for field in required_fields:
+            if field not in credentials or not credentials[field]:
+                missing.append(f"credentials.{field}")
+    
+    return len(missing) == 0, missing
+
+
 def load_config():
-    """Load config and credentials from JSON files"""
+    """Load config and credentials from JSON files with validation"""
     logger = get_logger("config")
 
-    with open("config.json", "r") as f:
-        config = json.load(f)
-
+    # Load config
+    try:
+        with open("config.json", "r") as f:
+            config = json.load(f)
+    except FileNotFoundError:
+        logger.error("config.json not found")
+        raise Exception("config.json file not found")
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in config.json: {e}")
+        raise Exception(f"Invalid JSON in config.json: {e}")
+    
+    # Validate config
+    config_valid, config_missing = validate_config(config)
+    if not config_valid:
+        logger.error(f"Config validation failed. Missing fields: {', '.join(config_missing)}")
+        raise Exception(f"Config validation failed. Missing required fields: {', '.join(config_missing)}")
+    
+    logger.info("Config loaded and validated successfully")
+    
+    # Load credentials
     try:
         with open("credentials.json", "r") as f:
             credentials = json.load(f)
@@ -47,8 +157,24 @@ def load_config():
     except FileNotFoundError:
         logger.warning("credentials.json not found. Using empty credentials.")
         credentials = {}
-
-    return config, credentials
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in credentials.json: {e}")
+        credentials = {}
+    
+    # Validate credentials (only if not empty)
+    credentials_valid = True
+    credentials_missing = []
+    if credentials:
+        is_paper = config.get("deployment", {}).get("paper_trading", False)
+        credentials_valid, credentials_missing = validate_credentials(credentials, is_paper)
+        if not credentials_valid:
+            logger.warning(f"Credentials validation failed. Missing fields: {', '.join(credentials_missing)}")
+    else:
+        # If credentials file not found, mark as invalid
+        credentials_valid = False
+        credentials_missing = ["credentials.json file not found"]
+    
+    return config, credentials, config_valid, credentials_valid, config_missing, credentials_missing
 
 
 def setup_brokers(config, credentials):

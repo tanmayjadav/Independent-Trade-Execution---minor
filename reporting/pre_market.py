@@ -142,6 +142,10 @@ def send_pre_market_notifications(
     *,
     config: dict,
     credentials_loaded: bool,
+    config_valid: bool = True,
+    credentials_valid: bool = True,
+    config_missing: list[str] = None,
+    credentials_missing: list[str] = None,
     is_paper: bool,
     md_broker,
     instrument_manager,
@@ -167,7 +171,20 @@ def send_pre_market_notifications(
     checks: list[tuple[str, bool, str]] = []
 
     checks.append(("mode.paper_trading", bool(is_paper), "paper" if is_paper else "live"))
-    checks.append(("credentials.loaded", bool(credentials_loaded), "ok" if credentials_loaded else "missing/empty"))
+    
+    # Config validation check
+    config_missing_str = ", ".join(config_missing) if config_missing else "none"
+    config_status = "ok" if config_valid else f"missing: {config_missing_str}"
+    checks.append(("config.validated", config_valid, config_status))
+    
+    # Credentials validation check
+    if credentials_loaded:
+        cred_missing_str = ", ".join(credentials_missing) if credentials_missing else "none"
+        cred_status = "ok" if credentials_valid else f"missing: {cred_missing_str}"
+        checks.append(("credentials.validated", credentials_valid, cred_status))
+    else:
+        checks.append(("credentials.loaded", False, "file not found"))
+        checks.append(("credentials.validated", False, "file not found"))
 
     # Market-data broker connectivity (paper mode usually)
     md_ok = bool(md_broker is not None)
@@ -202,11 +219,25 @@ def send_pre_market_notifications(
 
     # Decide GO/NO-GO: strict on key infra
     critical_keys = {
+        "config.validated",  # Config must be valid
         "market_data.broker_ready",
         "instruments.count",
         "underlying.resolved",
-        "market_data.rest_ltp",
+        # Note: market_data.rest_ltp excluded from critical before market opens
     }
+    
+    # Credentials are critical only if credentials file was loaded
+    # (If file not found, it's already handled in checks)
+    if credentials_loaded:
+        critical_keys.add("credentials.validated")
+    
+    # Only require LTP if market is open or about to open (within 5 minutes)
+    from datetime import time as time_obj
+    from market.market_clock import MarketClock
+    now_time = datetime.now().time()
+    if MarketClock.is_market_open() or now_time >= time_obj(9, 10):
+        critical_keys.add("market_data.rest_ltp")
+    
     failures = [name for (name, ok, _) in checks if (name in critical_keys and not ok)]
     go = len(failures) == 0
 

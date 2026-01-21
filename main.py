@@ -31,7 +31,7 @@ def main():
     """Main trading system entry point"""
     
     # Load configuration
-    config, credentials = load_config()
+    config, credentials, config_valid, credentials_valid, config_missing, credentials_missing = load_config()
 
     # Configure market clock early (pre-market scheduler relies on this)
     try:
@@ -73,6 +73,10 @@ def main():
                     send_pre_market_notifications(
                         config=config,
                         credentials_loaded=bool(credentials),
+                        config_valid=config_valid,
+                        credentials_valid=credentials_valid,
+                        config_missing=config_missing,
+                        credentials_missing=credentials_missing,
                         is_paper=is_paper,
                         md_broker=md_broker,
                         instrument_manager=im,
